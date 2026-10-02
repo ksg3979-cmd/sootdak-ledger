@@ -1,69 +1,72 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useMonth } from "@/components/AppShell";
 import { ConfirmDialog, Notice } from "@/components/ui";
-import { useLedger } from "@/components/useLedger";
 import { BreakevenCard } from "@/components/BreakevenCard";
 import { WeekdayCard } from "@/components/WeekdayCard";
-import { useDaily } from "@/components/useDaily";
-import { useSettlement } from "@/components/useSettlement";
+import { FindingsCard } from "@/components/FindingsCard";
+import { RatioCard } from "@/components/RatioCard";
+import { SummaryCopyCard } from "@/components/SummaryCopyCard";
+import { useMonthPnl } from "@/components/useMonthPnl";
 import { num, pctText, signed, won } from "@/lib/format";
-import { closeMonth, isClosed, monthLabel } from "@/lib/month";
-import { compareLines, computePnl, type PnlLine } from "@/lib/pnl";
+import { closeMonth, isClosed, monthLabel, prevMonth } from "@/lib/month";
+import { compareLines, type Pnl, type PnlLine } from "@/lib/pnl";
 import { getStore } from "@/lib/storage";
-import { monthSummary } from "@/lib/daily";
+import { monthFindings, monthSources, type FindingsInput } from "@/lib/findings";
+import { missingFixedCosts } from "@/lib/missingFixed";
 import { dayTotals } from "@/lib/weekday";
-import { EMPTY_FIXED_LABOR, FIXED_LABOR_KEY, type FixedLabor } from "@/lib/labor";
-import { fixedCostGaps, FIXED_COSTS_KEY, type FixedCost } from "@/lib/fixedCosts";
 import { PURCHASES_KEY_PREFIX, type Purchase } from "@/lib/costing/purchases";
 import { buildTaxSheets, taxFileName } from "@/lib/taxExport";
 import type { Transaction } from "@/lib/types";
 
 export default function PnlPage() {
   const { month } = useMonth();
-  const ledger = useLedger(month);
-  const daily = useDaily(month);
-  const settlement = useSettlement(month, ledger, daily);
+  const cur = useMonthPnl(month);
+  const prev = useMonthPnl(prevMonth(month)); // 지난달도 같은 잣대로 계산해서 비교한다
+  const { ledger, daily, settlement, summary, pnl, purchaseCount, today } = cur;
   const [open, setOpen] = useState<string | null>(null);
   const [asking, setAsking] = useState(false);
-  const [fixedLabor, setFixedLabor] = useState<FixedLabor>(EMPTY_FIXED_LABOR);
-  // 그 달 매입 영수증의 재료비 합계 — 통장에서 아직 안 나간 몫을 원가에 더하려고
-  const [materialPurchases, setMaterialPurchases] = useState(0);
-  const [fixedCosts, setFixedCosts] = useState<FixedCost[]>([]);
-  useEffect(() => {
-    getStore()
-      .getSetting<FixedLabor>(FIXED_LABOR_KEY)
-      .then((v) => v && setFixedLabor(v))
-      .catch(() => {});
-  }, []);
-  useEffect(() => {
-    getStore()
-      .getSetting<Purchase[]>(PURCHASES_KEY_PREFIX + month)
-      .then((ps) => {
-        const sum = (ps ?? []).reduce((a, p) => a + (p.lines ?? []).filter((l) => l.category === "원재료비" || l.category === "기타재료비").reduce((x, l) => x + l.amount, 0), 0);
-        setMaterialPurchases(sum);
-      })
-      .catch(() => setMaterialPurchases(0));
-  }, [month]);
-  useEffect(() => {
-    getStore()
-      .getSetting<FixedCost[]>(FIXED_COSTS_KEY)
-      .then((v) => setFixedCosts(v ?? []))
-      .catch(() => {});
-  }, []);
 
-  if (ledger.loading || daily.loading || !settlement.loaded) return <p className="py-10 text-center text-sm text-stone-500">불러오는 중…</p>;
+  if (cur.loading || prev.loading) return <p className="py-10 text-center text-sm text-stone-500">불러오는 중…</p>;
   if (ledger.error) return <Notice tone="error">{ledger.error}</Notice>;
 
-  const hourlyLabor = monthSummary(month, daily.sales, daily.shifts, daily.staff).labor;
   const openDays = dayTotals(daily.sales, daily.channels).length; // 매출이 있었던 날 = 영업일
-  const pnl = computePnl(ledger.txs, settlement.effectiveSales, { hourly: hourlyLabor, salary: fixedLabor.salary, insurance: fixedLabor.insurance }, materialPurchases, fixedCostGaps(fixedCosts, ledger.txs));
-  const hasPrev = ledger.prevTxs.length > 0 || ledger.prevSales.length > 0;
-  const diff = compareLines(pnl, hasPrev ? computePnl(ledger.prevTxs, ledger.prevSales) : null);
+  const hasPrev = !prev.empty;
+  const diff = compareLines(pnl, hasPrev ? prev.pnl : null);
   const closed = isClosed(ledger.closing);
-  const empty = ledger.txs.length === 0 && settlement.effectiveSales.length === 0;
+  const empty = cur.empty;
+  const estimateTotal = pnl.estimates.reduce((a, e) => a + e.amount, 0); // 확정 아닌 몫 (어림·청구서 금액)
+  const missingSales = pnl.revenueBasis === "실매출" ? summary.missingDays.length : 0; // 빈 날은 0원이 아니라 "미입력"
+  const missingFixed = missingFixedCosts(ledger.prevTxs, ledger.txs, ledger.rules, ledger.lastBankDate, cur.fixedCosts);
+  const findingsInput: FindingsInput = {
+    month,
+    today,
+    lastBankDate: ledger.lastBankDate,
+    needsReview: pnl.needsReview,
+    unclassified: pnl.unclassified,
+    revenueBasis: pnl.revenueBasis,
+    missingDays: summary.missingDays,
+    enteredDays: summary.enteredDays,
+    settlements: settlement.results,
+    nameOf: (id) => daily.channels.find((c) => c.id === id)?.name ?? id,
+    purchaseCount,
+    laborEstimated: pnl.laborEstimated,
+    extra: missingFixed.length
+      ? [
+          {
+            level: "warn",
+            text: `지난달엔 나갔는데 이번 달 통장엔 없는 고정비 ${missingFixed.length}건: ${missingFixed
+              .slice(0, 3)
+              .map((m) => `${m.label} ${num(m.prevAmount)}원`)
+              .join(", ")}${missingFixed.length > 3 ? " …" : ""} — 빠진 건 아닌지 보세요`,
+            href: "/upload",
+            action: "올리기 탭",
+          },
+        ]
+      : [],
+  };
 
   async function close() {
     setAsking(false);
@@ -90,10 +93,20 @@ export default function PnlPage() {
         <div className={`card col-span-2 ${pnl.operatingProfit >= 0 ? "" : "ring-red-300"}`}>
           <p className="text-xs font-semibold text-stone-500">이번 달 실제로 남은 돈 (영업이익)</p>
           <p className={`num mt-1 text-3xl font-extrabold ${pnl.operatingProfit >= 0 ? "text-emerald-700" : "text-red-600"}`}>{won(pnl.operatingProfit)}</p>
-          <p className="num mt-1 text-sm text-stone-600">
-            이익률 {pctText(pnl.operatingMargin)}
-            {diff["영업이익"] !== null && diff["영업이익"] !== undefined && <span className="ml-2 text-xs">지난달 대비 {signed(diff["영업이익"]!)}</span>}
-          </p>
+          <p className="num mt-1 text-sm text-stone-600">이익률 {pctText(pnl.operatingMargin)}</p>
+          {hasPrev && (
+            <p className="num mt-0.5 text-xs text-stone-500">
+              {monthLabel(prevMonth(month)).slice(6)} {won(prev.pnl.operatingProfit)} → {monthLabel(month).slice(6)} {won(pnl.operatingProfit)}{" "}
+              <span className={diff["영업이익"]! >= 0 ? "text-emerald-700" : "text-red-600"}>({signed(diff["영업이익"] ?? 0)})</span>
+            </p>
+          )}
+          <Formula pnl={pnl} />
+          {(estimateTotal > 0 || missingSales > 0) && (
+            <p className="mt-2 flex flex-wrap gap-1.5 text-[11px]">
+              {estimateTotal > 0 && <span className="rounded bg-violet-100 px-1.5 py-0.5 font-bold text-violet-900">어림 {won(estimateTotal)} 섞임 — 확정 아님</span>}
+              {missingSales > 0 && <span className="rounded bg-stone-100 px-1.5 py-0.5 font-bold text-stone-700">매출 미입력 {missingSales}일 — 넣으면 이익이 바뀌어요</span>}
+            </p>
+          )}
         </div>
         <div className="card">
           <p className="text-xs font-semibold text-stone-500">총매출</p>
@@ -116,22 +129,7 @@ export default function PnlPage() {
         </div>
       </section>
 
-      {pnl.revenueBasis === "입금액" && (
-        <Notice tone="warn">
-          실매출 미입력 — 지금 매출은 <b>통장 입금액 기준</b>이라 배달앱 수수료가 안 보여요.{" "}
-          <Link href="/channels" className="font-bold underline">
-            배달앱 탭에서 입력
-          </Link>
-        </Notice>
-      )}
-      {pnl.needsReview > 0 && (
-        <Notice tone="warn">
-          확인이 필요한 줄이 <b>{pnl.needsReview}줄</b> 남았어요{pnl.unclassified > 0 && ` (그중 ${pnl.unclassified}줄은 아직 손익에 안 들어갔어요)`}.{" "}
-          <Link href="/upload" className="font-bold underline">
-            올리기 탭에서 확인
-          </Link>
-        </Notice>
-      )}
+      <FindingsCard sources={monthSources(findingsInput)} findings={monthFindings(findingsInput)} />
 
       <section className="card">
         <div className="mb-2 flex items-baseline justify-between">
@@ -141,27 +139,57 @@ export default function PnlPage() {
         <p className="mb-1 rounded-lg bg-stone-50 px-2 py-1.5 text-xs text-stone-600">
           기준 — <b>매출·배달앱 수수료</b>: 주문이 발생한 달 · <b>비용</b>: 통장에서 돈이 나간 날. 다른 달에 결제한 비용은 지출추가 탭에서 날짜를 맞춰 넣을 수 있어요.
         </p>
-        {pnl.fixedUnpaid > 0 && (
-          <p className="mb-1 rounded-lg bg-amber-50 px-2 py-1.5 text-xs text-amber-900">
-            <b>아직 안 낸 고정비 {won(pnl.fixedUnpaid)}도 넣어 뒀어요</b> — 청구서는 왔는데 다음 달 초에 나가는 돈이에요(석쇠 대여비·가스요금 등). 금액은 <Link href="/rules" className="font-bold underline">규칙 탭</Link>에서 매달 고쳐요.
-          </p>
-        )}
-        {pnl.materialUnpaid > 0 && (
-          <p className="mb-1 rounded-lg bg-amber-50 px-2 py-1.5 text-xs text-amber-900">
-            <b>매출원가에 아직 안 낸 재료비 {won(pnl.materialUnpaid)}이 들어 있어요</b> — 매입 영수증에는 있는데 통장에서 아직 안 나간 돈이에요(주류 월말 결제, 거래처 외상, 다음 달 10일에 내는 대금). 9월에 받은 재료는 9월 원가라서 미리 넣어 둬요. 실제로 나가면 그 금액으로 바뀌어요.
-          </p>
-        )}
-        {pnl.laborEstimated && (
-          <p className="mb-1 rounded-lg bg-violet-50 px-2 py-1.5 text-xs text-violet-900">
-            <b>노무관리비는 어림값</b>이에요 — 급여가 아직 통장에서 안 나가서 오늘 탭 근무(시간 × 시급)와 월 고정 인건비(월급·4대보험, 오늘 탭 “직원·채널 설정”)로 채웠어요. 급여가 나가 통장을 올리면 실제 금액으로 바뀌어요.
-          </p>
+        {pnl.estimates.length > 0 && (
+          <details className="mb-1 rounded-lg bg-violet-50 px-2 py-1.5 text-xs text-violet-900">
+            <summary className="cursor-pointer">
+              <b>어림값 {won(estimateTotal)}</b>이 들어 있어요 — 통장에서 아직 안 나간 돈이라 미리 채웠어요. 나가면 실제 금액으로 바뀌어요. <span className="underline">자세히</span>
+            </summary>
+            <ul className="mt-1.5 space-y-1.5">
+              {pnl.laborUnpaid > 0 && (
+                <li>
+                  <b>인건비 {won(pnl.laborUnpaid)}</b> — 급여가 아직 안 나가서 오늘 탭 근무(시간 × 시급)와 월 고정 인건비(월급·4대보험, 오늘 탭 “직원·채널 설정”)로 채웠어요.
+                </li>
+              )}
+              {pnl.materialUnpaid > 0 && (
+                <li>
+                  <b>외상 재료비 {won(pnl.materialUnpaid)}</b> — 매입 영수증에는 있는데 통장에서 아직 안 나간 돈이에요(주류 월말 결제, 거래처 외상, 다음 달 10일 대금). {monthLabel(month).slice(6)}에 받은 재료는 {monthLabel(month).slice(6)} 원가라서 미리 넣어 둬요.
+                </li>
+              )}
+              {pnl.fixedUnpaid > 0 && (
+                <li>
+                  <b>고정비 {won(pnl.fixedUnpaid)}</b> ({pnl.estimates.filter((e) => e.kind === "fixed").map((e) => e.what).join(", ")}) — 청구서는 왔는데 다음 달 초에 나가는 돈이에요. 금액은{" "}
+                  <Link href="/rules" className="font-bold underline">
+                    규칙 탭
+                  </Link>
+                  에서 매달 고쳐요.
+                </li>
+              )}
+            </ul>
+          </details>
         )}
         <ul className="divide-y divide-stone-100">
           {pnl.lines.map((line) => (
-            <PnlRow key={line.label} line={line} diff={diff[line.label] ?? null} open={open === line.label} onToggle={() => setOpen(open === line.label ? null : line.label)} estimated={line.label === "노무관리비" && pnl.laborEstimated} />
+            <PnlRow
+              key={line.label}
+              line={line}
+              diff={diff[line.label] ?? null}
+              open={open === line.label}
+              onToggle={() => setOpen(open === line.label ? null : line.label)}
+              estimated={pnl.estimates.some((e) => e.major === line.label)}
+            />
           ))}
         </ul>
       </section>
+
+      <RatioCard pnl={pnl} />
+
+      <Link href="/year" className="card flex items-center justify-between">
+        <span>
+          <span className="block text-sm font-bold">📅 1년 한눈에 보기</span>
+          <span className="block text-xs text-stone-500">월별 매출·영업이익 막대 · 한 해 비용 구성 · 월별 표</span>
+        </span>
+        <span className="text-orange-700">→</span>
+      </Link>
 
       <WeekdayCard month={month} sales={daily.sales} channels={daily.channels} />
 
@@ -192,6 +220,15 @@ export default function PnlPage() {
         )}
       </section>
 
+      <SummaryCopyCard
+        monthName={monthLabel(month).slice(6)}
+        prevName={monthLabel(prevMonth(month)).slice(6)}
+        pnl={pnl}
+        prevProfit={hasPrev ? prev.pnl.operatingProfit : null}
+        closed={closed}
+        missingDays={missingSales}
+      />
+
       <TaxExportCard month={month} txs={ledger.txs} needsReview={pnl.needsReview} closed={closed} />
 
       {asking && (
@@ -202,6 +239,23 @@ export default function PnlPage() {
         </ConfirmDialog>
       )}
     </>
+  );
+}
+
+// 영업이익이 어떻게 나왔는지 금액으로 풀어 쓴 식 (해모닉에서 따옴) — 숫자를 믿고 볼 수 있게
+function Formula({ pnl }: { pnl: Pnl }) {
+  const costs = pnl.lines.filter((l) => l.kind === "cost" && l.amount !== 0);
+  return (
+    <p className="num mt-2 rounded-lg bg-stone-50 px-2 py-1.5 text-[11px] leading-5 text-stone-600">
+      총매출 {num(pnl.revenue)}
+      {costs.map((l) => (
+        <span key={l.label}>
+          {" "}
+          {l.amount > 0 ? "−" : "+"} {l.label} {num(Math.abs(l.amount))}
+        </span>
+      ))}{" "}
+      = <b className="text-stone-800">영업이익 {num(pnl.operatingProfit)}</b>
+    </p>
   );
 }
 
@@ -222,10 +276,13 @@ function PnlRow({ line, diff, open, onToggle, estimated = false }: { line: PnlLi
           {estimated && <span className="ml-1 rounded bg-violet-100 px-1.5 py-0.5 text-[11px] font-bold text-violet-900">어림</span>}
           {canOpen && <span className="ml-1 text-[11px] text-stone-400">{open ? "▲" : "▼"}</span>}
         </span>
-        <span className="num flex items-baseline gap-2 text-right">
-          {diff !== null && diff !== 0 && <span className="hidden text-xs text-stone-400 sm:inline">{signed(diff)}</span>}
-          <span className={`text-sm ${strong ? "font-bold" : ""}`}>{num(line.amount)}</span>
-          <span className="w-12 text-xs text-stone-500">{pctText(line.pct)}</span>
+        <span className="num flex flex-col items-end text-right sm:flex-row sm:items-baseline sm:gap-2">
+          {/* 지난달 대비 — 폰에서는 금액 밑에, 넓은 화면에서는 금액 앞에 */}
+          <span className="order-2 text-[11px] text-stone-400 sm:order-1 sm:text-xs">{diff !== null && diff !== 0 ? `지난달 ${signed(diff)}` : ""}</span>
+          <span className="order-1 flex items-baseline gap-2 sm:order-2">
+            <span className={`text-sm ${strong ? "font-bold" : ""}`}>{num(line.amount)}</span>
+            <span className="w-12 text-xs text-stone-500">{pctText(line.pct)}</span>
+          </span>
         </span>
       </button>
       {open && (

@@ -3,6 +3,7 @@ import { feeOf, round1 } from "./channels";
 import type { ChannelSale, Transaction } from "./types";
 import type { LaborEstimate } from "./labor";
 import { totalFixedGap, type FixedCostGap } from "./fixedCosts";
+import { expandSplits } from "./txSplit";
 
 export interface PnlLine {
   label: string;
@@ -10,6 +11,13 @@ export interface PnlLine {
   pct: number | null; // 매출 대비 %
   kind: "revenue" | "cost" | "subtotal" | "result";
   minors?: { label: string; amount: number }[];
+}
+
+export interface PnlEstimate {
+  kind: "labor" | "material" | "fixed";
+  major: Major; // 손익표 어느 줄에 들어갔나
+  what: string; // "아직 안 나간 인건비", "아직 안 낸 재료비 (외상)", 고정비 이름
+  amount: number;
 }
 
 export interface Pnl {
@@ -27,6 +35,9 @@ export interface Pnl {
   laborEstimated: boolean; // 노무관리비를 어림값(오늘 탭 근무 + 월 고정 인건비)으로 채웠나 — 급여가 통장에서 나가면 false
   materialUnpaid: number; // 매입 영수증에는 있는데 아직 통장에서 안 나간 재료비 (주류 월말 결제, 거래처 외상 등)
   fixedUnpaid: number; // 청구서는 왔는데 아직 통장에서 안 나간 고정비 (석쇠 대여비, 가스요금 등)
+  laborUnpaid: number; // 아직 안 나간 인건비 어림 금액
+  // 통장에 아직 없어서 어림·청구서 금액으로 채운 몫 (확정 아님). 영업이익에 이만큼 "어림"이 섞여 있다
+  estimates: PnlEstimate[];
   unclassified: number; // 아직 분류 안 된 줄 수
   needsReview: number; // 확인 필요 표시가 남은 줄 수
 }
@@ -39,7 +50,9 @@ const pct = (amount: number, revenue: number) => (revenue > 0 ? round1((amount /
 //    통장에서 나간 재료비보다 많으면 그 차이를 "아직 안 낸 재료비"로 매출원가에 더한다.
 //    9월에 받은 재료값을 10월에 내더라도 그 재료비는 9월 원가여서 그렇다 (인건비를 어림으로 채우는 것과 같은 이치).
 //  fixedGaps: 매달 나가는 고정비 중 아직 통장에서 안 나간 몫 (lib/fixedCosts.ts)
-export function computePnl(txs: Transaction[], sales: ChannelSale[], estimate?: LaborEstimate, materialPurchases = 0, fixedGaps: FixedCostGap[] = []): Pnl {
+export function computePnl(all: Transaction[], sales: ChannelSale[], estimate?: LaborEstimate, materialPurchases = 0, fixedGaps: FixedCostGap[] = []): Pnl {
+  // 나눠 분류한 줄은 몫마다 한 줄로 펴서 센다
+  const txs = expandSplits(all);
   const hasSales = sales.some((s) => s.orders > 0);
 
   // 통장 입금: 채널이 붙은 줄은 대조용. 채널 입력이 있으면 매출로 다시 더하지 않는다(중복 방지).
@@ -157,9 +170,15 @@ export function computePnl(txs: Transaction[], sales: ChannelSale[], estimate?: 
     laborEstimated,
     materialUnpaid,
     fixedUnpaid: totalFixedGap(fixedGaps),
+    laborUnpaid: laborGap,
+    estimates: [
+      ...(laborGap > 0 ? [{ kind: "labor" as const, major: "노무관리비" as Major, what: "아직 안 나간 인건비", amount: laborGap }] : []),
+      ...(materialUnpaid > 0 ? [{ kind: "material" as const, major: "매출원가" as Major, what: "아직 안 낸 재료비 (외상)", amount: materialUnpaid }] : []),
+      ...fixedGaps.filter((g) => g.gap > 0).map((g) => ({ kind: "fixed" as const, major: g.cost.major, what: g.cost.name || g.cost.minor, amount: g.gap })),
+    ],
     deliveryFee,
-    unclassified: txs.filter((t) => !t.major).length,
-    needsReview: txs.filter((t) => t.review).length,
+    unclassified: all.filter((t) => !t.major).length,
+    needsReview: all.filter((t) => t.review).length,
   };
 }
 
